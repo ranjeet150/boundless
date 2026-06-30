@@ -1,11 +1,8 @@
 'use client';
 
 import { useParams, useSearchParams } from 'next/navigation';
-import { Sparkles } from 'lucide-react';
-import { toast } from 'sonner';
 
-import { BoundlessButton } from '@/components/buttons';
-import { ApiError } from '@/lib/api';
+import AiRegenerateControl from '@/components/ai/AiRegenerateControl';
 import {
   useDraft,
   useRegenerateDraftSection,
@@ -21,15 +18,14 @@ interface RegenerateSectionButtonProps {
 }
 
 /**
- * Self-contained "Regenerate with AI" button for a wizard step. Derives the org
- * + draft from the route, and renders only on AI-generated drafts (the server
- * owns the suggestion, surfaced via `draft.aiGeneration`). On success it hands
- * the regenerated section back to the tab to apply to its form.
+ * Per-section "Regenerate with AI" for the hackathon wizard. Derives the org +
+ * draft from the route, renders only on AI-generated drafts, and delegates the
+ * steerable + preview/accept-discard UX to the shared AiRegenerateControl.
  */
 export default function RegenerateSectionButton({
   section,
   onApply,
-  label = 'Regenerate with AI',
+  label,
 }: RegenerateSectionButtonProps) {
   const params = useParams();
   const searchParams = useSearchParams();
@@ -40,41 +36,17 @@ export default function RegenerateSectionButton({
   const { data: draft } = useDraft(organizationId, draftId || undefined);
   const regenerate = useRegenerateDraftSection(organizationId);
 
-  // Available only on AI-generated drafts.
-  if (!draftId || !draft?.aiGeneration) return null;
-
-  const handleClick = async () => {
-    try {
-      const result = await regenerate.mutateAsync({
-        draftId,
-        body: { section },
-      });
-      onApply(result.data as Record<string, unknown>);
-      toast.success('Section regenerated. Review the new values.');
-    } catch (err) {
-      if (err instanceof ApiError) {
-        if (err.status === 503) {
-          toast.error('The AI assistant is busy. Try again in a moment.');
-          return;
-        }
-        toast.error(err.message || 'Could not regenerate this section.');
-        return;
-      }
-      toast.error('Could not regenerate this section.');
-    }
-  };
-
   return (
-    <BoundlessButton
-      type='button'
-      variant='outline'
-      size='sm'
-      className='gap-2'
-      loading={regenerate.isPending}
-      onClick={handleClick}
-    >
-      <Sparkles className='h-4 w-4' />
-      {label}
-    </BoundlessButton>
+    <AiRegenerateControl
+      available={Boolean(draftId && draft?.aiGeneration)}
+      isRunning={regenerate.isPending}
+      label={label}
+      onRun={instructions =>
+        regenerate
+          .mutateAsync({ draftId, body: { section, instructions } })
+          .then(r => r.data as Record<string, unknown>)
+      }
+      onApply={onApply}
+    />
   );
 }

@@ -1,7 +1,8 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
+import { useQueryClient } from '@tanstack/react-query';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
@@ -27,13 +28,31 @@ import {
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { BoundlessButton } from '@/components/buttons';
-import LoadingSpinner from '@/components/LoadingSpinner';
-import { ApiError } from '@/lib/api';
-import {
-  useGenerateDraftFromBrief,
-  useBriefTemplates,
+import AiClarifyQuestions, {
+  type ClarifyAnswer,
+} from '@/components/ai/AiClarifyQuestions';
+import AiExampleReference, {
+  type ExampleItem,
+} from '@/components/ai/AiExampleReference';
+import AiUsageNote from '@/components/ai/AiUsageNote';
+import AiStreamPreview, {
+  type PreviewField,
+} from '@/components/ai/AiStreamPreview';
+import { streamDraft } from '@/lib/ai/stream-draft';
+import { useHackathons } from '@/hooks/use-hackathons';
+import { useClarifyDraft, useBriefTemplates } from '@/features/hackathons';
+import { hackathonKeys } from '@/features/hackathons/api/keys';
+import type {
+  BriefTemplate,
+  HackathonClarifyQuestion,
 } from '@/features/hackathons';
-import type { BriefTemplate } from '@/features/hackathons';
+
+/** Fold chosen clarify answers back into the brief before drafting. */
+function augmentBrief(brief: string, answers: ClarifyAnswer[]): string {
+  if (answers.length === 0) return brief;
+  const lines = answers.map(a => `- ${a.question} ${a.label}`).join('\n');
+  return `${brief}\n\nAdditional details:\n${lines}`;
+}
 
 const briefSchema = z.object({
   brief: z
@@ -51,14 +70,6 @@ const briefSchema = z.object({
 });
 
 type BriefForm = z.infer<typeof briefSchema>;
-
-const PROGRESS_STEPS = [
-  'Reading your brief…',
-  'Shaping tracks and prizes…',
-  'Drafting judging criteria…',
-  'Laying out the timeline…',
-  'Finalizing your draft…',
-];
 
 function todayIso(): string {
   return new Date().toISOString().slice(0, 10);
@@ -104,38 +115,70 @@ export default function GenerateWithAiDialog({
   onOpenChange,
 }: GenerateWithAiDialogProps) {
   const router = useRouter();
-  const generate = useGenerateDraftFromBrief(organizationId);
+  const queryClient = useQueryClient();
+  const clarify = useClarifyDraft(organizationId);
   const { data: templates } = useBriefTemplates();
-  const [progressStep, setProgressStep] = useState(0);
   const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(
     null
   );
+  // Live streaming reveal: partial draft snapshots + an abort handle for Cancel.
+  const [streaming, setStreaming] = useState(false);
+  const [partial, setPartial] = useState<Record<string, unknown> | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+  // Adaptive clarify gate: when the brief is thin we collect a couple of chip
+  // answers before drafting.
+  const [questions, setQuestions] = useState<HackathonClarifyQuestion[]>([]);
+  const [pending, setPending] = useState<BriefForm | null>(null);
+  // Optional "match a past hackathon" style reference (fed to the model as examples).
+  const [exampleId, setExampleId] = useState<string | null>(null);
+  const { hackathons: pastHackathons } = useHackathons({
+    organizationId,
+    pageSize: 20,
+  });
+  const exampleItems: ExampleItem[] = useMemo(
+    () =>
+      (pastHackathons ?? []).map(h => {
+        const desc = (h.description ?? '').slice(0, 400);
+        return {
+          id: h.id,
+          label: h.name || 'Untitled hackathon',
+          example: `A past hackathon called "${h.name}".${
+            desc ? `\n${desc}` : ''
+          }`,
+        };
+      }),
+    [pastHackathons]
+  );
+  const exampleText =
+    exampleItems.find(i => i.id === exampleId)?.example ?? null;
 
   const form = useForm<BriefForm>({
     resolver: zodResolver(briefSchema),
     defaultValues: { brief: '', budgetCapUsdc: '', earliestStart: todayIso() },
   });
 
-  const isGenerating = generate.isPending;
+  const isClarifying = clarify.isPending;
 
+  // Reset selected template + clarify + stream state when dialog closes.
   useEffect(() => {
-    if (!isGenerating) {
-      setProgressStep(0);
-      return;
+    if (!open) {
+      setSelectedTemplateId(null);
+      setQuestions([]);
+      setPending(null);
+      setExampleId(null);
+      setStreaming(false);
+      setPartial(null);
     }
-    const id = setInterval(() => {
-      setProgressStep(step => Math.min(step + 1, PROGRESS_STEPS.length - 1));
-    }, 4000);
-    return () => clearInterval(id);
-  }, [isGenerating]);
-
-  // Reset selected template when dialog closes.
-  useEffect(() => {
-    if (!open) setSelectedTemplateId(null);
   }, [open]);
 
+  const cancelStream = () => {
+    abortRef.current?.abort();
+    setStreaming(false);
+    setPartial(null);
+  };
+
   const handleClose = (next: boolean) => {
-    if (isGenerating) return;
+    if (streaming) return;
     if (!next)
       form.reset({ ...form.getValues(), brief: form.getValues().brief });
     onOpenChange(next);
@@ -150,50 +193,102 @@ export default function GenerateWithAiDialog({
     form.setValue('brief', template.brief, { shouldValidate: true });
   };
 
-  const onSubmit = async (values: BriefForm) => {
-    try {
-      const result = await generate.mutateAsync(values);
-      toast.success('Draft generated. Review and publish when ready.');
-      onOpenChange(false);
-      router.push(
-        `/organizations/${organizationId}/hackathons/drafts/${result.draftId}`
-      );
-    } catch (err) {
-      handleGenerateError(err);
-    }
+  const runGenerate = async (values: BriefForm, answers: ClarifyAnswer[]) => {
+    const ac = new AbortController();
+    abortRef.current = ac;
+    setPartial(null);
+    setStreaming(true);
+    await streamDraft(
+      `/api/organizations/${organizationId}/hackathons/draft/from-brief/stream`,
+      {
+        ...values,
+        brief: augmentBrief(values.brief, answers),
+        ...(exampleText ? { examples: [exampleText] } : {}),
+      },
+      ac.signal,
+      {
+        onPartial: setPartial,
+        onDone: ({ draftId, draft }) => {
+          if (draft) {
+            queryClient.setQueryData(
+              hackathonKeys.draft(organizationId, draftId),
+              draft
+            );
+          }
+          queryClient.invalidateQueries({
+            queryKey: hackathonKeys.drafts(organizationId),
+          });
+          toast.success('Draft generated. Review and publish when ready.');
+          setStreaming(false);
+          onOpenChange(false);
+          router.push(
+            `/organizations/${organizationId}/hackathons/drafts/${draftId}`
+          );
+        },
+        onError: e => {
+          setStreaming(false);
+          handleStreamError(e);
+        },
+      }
+    );
   };
 
-  const handleGenerateError = (err: unknown) => {
-    if (err instanceof ApiError) {
-      if (err.status === 503) {
-        toast.error('The AI assistant is busy right now.', {
-          description: 'You can start your hackathon manually instead.',
-          action: {
-            label: 'Start manually',
-            onClick: () => {
-              onOpenChange(false);
-              router.push(`/organizations/${organizationId}/hackathons/new`);
-            },
+  const onSubmit = async (values: BriefForm) => {
+    // Adaptive gate: ask the AI whether the brief needs clarifying questions.
+    try {
+      const verdict = await clarify.mutateAsync(values.brief);
+      if (!verdict.ready && verdict.questions.length > 0) {
+        setPending(values);
+        setQuestions(verdict.questions);
+        return;
+      }
+    } catch {
+      // Clarify is a soft gate — if it fails, draft from the brief as-is.
+    }
+    await runGenerate(values, []);
+  };
+
+  const handleStreamError = (err: { status?: number; message: string }) => {
+    if (err.status === 503) {
+      toast.error('The AI assistant is busy right now.', {
+        description: 'You can start your hackathon manually instead.',
+        action: {
+          label: 'Start manually',
+          onClick: () => {
+            onOpenChange(false);
+            router.push(`/organizations/${organizationId}/hackathons/new`);
           },
-        });
-        return;
-      }
-      if (err.status === 429) {
-        toast.error(
-          err.message || 'AI usage limit reached for this organization.'
-        );
-        return;
-      }
-      const fieldError = err.fieldErrors?.[0];
-      toast.error(
-        fieldError?.message ||
-          err.message ||
-          'Could not generate a draft. Please try again.'
-      );
+        },
+      });
       return;
     }
-    toast.error('Could not generate a draft. Please try again.');
+    toast.error(err.message || 'Could not generate a draft. Please try again.');
   };
+
+  // Live preview fields, derived from the streaming partial suggestion.
+  const previewFields: PreviewField[] = [
+    {
+      label: 'Name',
+      value: typeof partial?.name === 'string' ? partial.name : null,
+    },
+    {
+      label: 'Tagline',
+      value: typeof partial?.tagline === 'string' ? partial.tagline : null,
+    },
+    {
+      label: 'Tracks',
+      value: Array.isArray(partial?.tracks)
+        ? `${partial.tracks.length} track(s)`
+        : null,
+    },
+    {
+      label: 'Prizes',
+      value:
+        Array.isArray(partial?.prizeTiers) && partial.prizeTiers.length > 0
+          ? `${partial.prizeTiers.length} tier(s)`
+          : null,
+    },
+  ];
 
   const hasTemplates = templates && templates.length > 0;
 
@@ -212,16 +307,15 @@ export default function GenerateWithAiDialog({
           </DialogDescription>
         </DialogHeader>
 
-        {isGenerating ? (
-          <div className='flex flex-col items-center justify-center gap-4 py-10'>
-            <LoadingSpinner size='lg' variant='spinner' color='primary' />
-            <p className='text-sm text-gray-400'>
-              {PROGRESS_STEPS[progressStep]}
-            </p>
-            <p className='text-xs text-gray-600'>
-              This usually takes 15–30 seconds.
-            </p>
-          </div>
+        {streaming ? (
+          <AiStreamPreview fields={previewFields} onCancel={cancelStream} />
+        ) : questions.length > 0 && pending ? (
+          <AiClarifyQuestions
+            questions={questions}
+            isSubmitting={streaming}
+            onSubmit={answers => runGenerate(pending, answers)}
+            onSkip={() => runGenerate(pending, [])}
+          />
         ) : (
           <Form {...form}>
             <form onSubmit={form.handleSubmit(onSubmit)} className='space-y-4'>
@@ -243,6 +337,13 @@ export default function GenerateWithAiDialog({
                   </p>
                 </div>
               )}
+
+              <AiExampleReference
+                items={exampleItems}
+                value={exampleId}
+                onChange={setExampleId}
+                noun='hackathon'
+              />
 
               <FormField
                 control={form.control}
@@ -300,6 +401,8 @@ export default function GenerateWithAiDialog({
                 />
               </div>
 
+              <AiUsageNote organizationId={organizationId} />
+
               <DialogFooter className='gap-2 sm:gap-0'>
                 <BoundlessButton
                   type='button'
@@ -310,6 +413,7 @@ export default function GenerateWithAiDialog({
                 </BoundlessButton>
                 <BoundlessButton
                   type='submit'
+                  loading={isClarifying}
                   icon={<Sparkles className='h-4 w-4' />}
                   iconPosition='left'
                 >
